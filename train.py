@@ -42,9 +42,7 @@ IMAGE_SIZE = 224
 
 BATCH_SIZE = 64
 LEARNING_RATE_HEAD = 1e-3
-LEARNING_RATE_BACKBONE = 1e-4
 EPOCHS = 6
-FREEZE_EPOCHS = 2
 
 # the percentage of the training data to set aside as a validation set.
 VALIDATION_FRACTION = 0.2
@@ -149,9 +147,16 @@ def main():
     model = build_model(len(CLASSES)).to(device)
 
     criterion = nn.CrossEntropyLoss()
-    # We'll create the optimizer after (un)freezing so the parameter groups match.
-    optimizer = None
-    scheduler = None
+    # Freeze everything except the final Linear layer.
+    for p in model.parameters():
+        p.requires_grad = False
+    for p in model.classifier[-1].parameters():
+        p.requires_grad = True
+
+    optimizer = torch.optim.AdamW(
+        model.classifier[-1].parameters(), lr=LEARNING_RATE_HEAD, weight_decay=1e-4
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, EPOCHS))
 
     # Step 4) the training loop.
 
@@ -161,37 +166,12 @@ def main():
             "classes": CLASSES,
             "image_size": IMAGE_SIZE,
             "normalize": {"mean": mean, "std": std},
-            "arch": "mobilenet_v3_small",
+            "arch": "mobilenet_v3_small_frozen_backbone",
         }
         torch.save(payload, "model.pt")
 
     print(f"Training on device={device} ...", flush=True)
     for epoch in range(EPOCHS):
-        # Freeze backbone for first few epochs (train classifier head only).
-        if epoch == 0:
-            for p in model.features.parameters():
-                p.requires_grad = False
-            for p in model.classifier.parameters():
-                p.requires_grad = True
-            optimizer = torch.optim.AdamW(
-                model.classifier.parameters(), lr=LEARNING_RATE_HEAD, weight_decay=1e-4
-            )
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, FREEZE_EPOCHS))
-
-        if epoch == FREEZE_EPOCHS:
-            for p in model.features.parameters():
-                p.requires_grad = True
-            optimizer = torch.optim.AdamW(
-                [
-                    {"params": model.features.parameters(), "lr": LEARNING_RATE_BACKBONE},
-                    {"params": model.classifier.parameters(), "lr": LEARNING_RATE_HEAD},
-                ],
-                weight_decay=1e-4,
-            )
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=max(1, EPOCHS - FREEZE_EPOCHS)
-            )
-
         total_loss = 0.0
         correct = 0
         total = 0
@@ -233,8 +213,7 @@ def main():
                 val_total += images.size(0)
         val_accuracy = val_correct / val_total
         model.train()
-        if scheduler is not None:
-            scheduler.step()
+        scheduler.step()
 
         print(
             f"Epoch {epoch + 1}/{EPOCHS}  "
