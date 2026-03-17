@@ -1,82 +1,40 @@
-"""Example prediction code for the DSC 140B SoCalGuessr project.
+"""Prediction code for the DSC 140B SoCalGuessr project.
 
-This file is paired with `train.py`, which trains a model and saves its weights to
-`model.pt`. This file loads the saved model and uses it to make predictions on the test
-set.
-
-The autograder will call the `predict` function defined below. You are free to change
-the implementation, but the function signature must stay the same: it must accept a path
-to a directory of test images and return a dictionary mapping each filename to a
-predicted label as a string (e.g. "Los_Angeles").
-
+The autograder calls `predict(test_dir)`, where `test_dir` contains .jpg images.
+This loads `model.pt` (weights + metadata) and returns {filename: city}.
 """
 
 import pathlib
 
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
+from torchvision.models import mobilenet_v3_small
 from PIL import Image
 
 
-# these must match the values used during training in train.py
-CLASSES = sorted(
-    [
-        "Anaheim",
-        "Bakersfield",
-        "Los_Angeles",
-        "Riverside",
-        "SLO",
-        "San_Diego",
-    ]
-)
-
-# when we trained the model, we resized all images to this size before feeding them into
-# the model. We need to do the same thing here, since the model's weights were trained
-# on images of this size.
-IMAGE_WIDTH = 64
-IMAGE_HEIGHT = 32
+def build_model(num_classes: int) -> nn.Module:
+    model = mobilenet_v3_small(weights=None)
+    in_features = model.classifier[-1].in_features
+    model.classifier[-1] = nn.Linear(in_features, num_classes)
+    return model
 
 
-def load_and_transform_image(path):
-    """Load an image from disk and apply the same transforms used during training.
+class TestImageDataset(Dataset):
+    def __init__(self, root: pathlib.Path, transform):
+        self.root = pathlib.Path(root)
+        self.transform = transform
+        self.paths = sorted(self.root.glob("*.jpg"))
 
-    Parameters
-    ----------
-    path : str or pathlib.Path
-        Path to a .jpg image file.
+    def __len__(self):
+        return len(self.paths)
 
-    Returns
-    -------
-    torch.Tensor
-        A tensor of shape (1, 3, IMAGE_WIDTH, IMAGE_HEIGHT) ready to be fed into
-        the model.
-
-    """
-    image = Image.open(path).convert("RGB")
-    pipeline = transforms.Compose(
-        [
-            transforms.Resize((IMAGE_WIDTH, IMAGE_HEIGHT)),
-            transforms.ToTensor(),
-        ]
-    )
-    return pipeline(image).unsqueeze(0)  # add batch dimension
-
-
-# we must re-define the model architecture here in order to load the saved weights.
-
-
-class LogisticRegression(nn.Module):
-    """A single linear layer — logistic regression on flattened pixels."""
-
-    def __init__(self, input_dim, num_classes):
-        super().__init__()
-        self.flatten = nn.Flatten()
-        self.linear = nn.Linear(input_dim, num_classes)
-
-    def forward(self, x):
-        x = self.flatten(x)
-        return self.linear(x)
+    def __getitem__(self, idx):
+        path = self.paths[idx]
+        image = Image.open(path).convert("RGB")
+        image = self.transform(image)
+        return path.name, image
 
 
 def predict(test_dir):
@@ -96,20 +54,35 @@ def predict(test_dir):
     """
     test_dir = pathlib.Path(test_dir)
 
-    # Step 1) load the trained model.
-    input_dim = 3 * IMAGE_WIDTH * IMAGE_HEIGHT
-    model = LogisticRegression(input_dim, len(CLASSES))
-    model.load_state_dict(torch.load("model.pt", weights_only=True))
+    payload = torch.load("model.pt", map_location="cpu")
+    classes = payload["classes"]
+    image_size = int(payload["image_size"])
+    mean = tuple(payload["normalize"]["mean"])
+    std = tuple(payload["normalize"]["std"])
+
+    transform = transforms.Compose(
+        [
+            transforms.Resize(256),
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std),
+        ]
+    )
+
+    dataset = TestImageDataset(test_dir, transform=transform)
+    loader = DataLoader(dataset, batch_size=64, shuffle=False, num_workers=0)
+
+    model = build_model(len(classes))
+    model.load_state_dict(payload["state_dict"])
     model.eval()
 
-    # Step 2) run prediction on every test image.
     predictions = {}
     with torch.no_grad():
-        for path in sorted(test_dir.glob("*.jpg")):
-            image = load_and_transform_image(path)
-            output = model(image)
-            predicted_index = output.argmax(dim=1).item()
-            predictions[path.name] = CLASSES[predicted_index]
+        for names, images in loader:
+            outputs = model(images)
+            predicted = outputs.argmax(dim=1).tolist()
+            for name, idx in zip(names, predicted):
+                predictions[name] = classes[idx]
 
     return predictions
 

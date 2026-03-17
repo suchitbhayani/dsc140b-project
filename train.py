@@ -1,16 +1,7 @@
-"""Example code for the DSC 140B SoCalGuessr project.
+"""Training code for the DSC 140B SoCalGuessr project.
 
-This example code trains a simple logistic regression model on the training images. It
-is not meant to be a strong baseline -- it's just an example that shows you how to load
-the data and how to export the model's weights.
-
-This file is paired with `predict.py`, which loads the saved model and uses it to make
-predictions on the test set.
-
-Your training code does not *need* to look like this file, and you are allowed to use
-any model and training procedure you'd like. However, you *can* use this file as a
-starting point if you want.
-
+Trains a small *pretrained* vision model (MobileNetV3-Small) on the training images in
+`./data` and saves `model.pt` containing weights + metadata needed by `predict.py`.
 """
 
 import pathlib
@@ -19,7 +10,9 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision import transforms
+from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
 from PIL import Image
+import time
 
 
 # configuration ------------------------------------------------------------------------
@@ -43,18 +36,20 @@ CLASSES = sorted(
 # label (like 2), since PyTorch models work with numerical labels rather than strings.
 CLASS_TO_NUMBER = {name: i for i, name in enumerate(CLASSES)}
 
-# we'll resize all images to this size before feeding them into the model smaller image
-# sizes means fewer parameters and therefore faster training, but also less information
-# for the model to learn from
-IMAGE_WIDTH = 64
-IMAGE_HEIGHT = 32
+# ImageNet-style preprocessing for pretrained weights.
+# We'll train at 224x224 for best transfer performance.
+IMAGE_SIZE = 224
 
 BATCH_SIZE = 64
-LEARNING_RATE = 1e-3
-EPOCHS = 20
+LEARNING_RATE_HEAD = 1e-3
+LEARNING_RATE_BACKBONE = 1e-4
+EPOCHS = 6
+FREEZE_EPOCHS = 2
 
 # the percentage of the training data to set aside as a validation set.
 VALIDATION_FRACTION = 0.2
+
+SEED = 140
 
 
 # dataset ------------------------------------------------------------------------------
@@ -91,67 +86,119 @@ class SoCalDataset(Dataset):
 
 # model --------------------------------------------------------------------------------
 
-# this is a simple logistic regression model. It consists of a single linear layer that
-# takes in the flattened pixel values and outputs a vector of class scores.
-
-# when you're defining your own model, this is the part of the code that you'll likely
-# change the most
-
-class LogisticRegression(nn.Module):
-    """A single linear layer — logistic regression on flattened pixels."""
-
-    def __init__(self, input_dim, num_classes):
-        super().__init__()
-        self.flatten = nn.Flatten()
-        self.linear = nn.Linear(input_dim, num_classes)
-
-    def forward(self, x):
-        x = self.flatten(x)
-        return self.linear(x)
+def build_model(num_classes: int) -> nn.Module:
+    weights = MobileNet_V3_Small_Weights.DEFAULT
+    model = mobilenet_v3_small(weights=weights)
+    # Replace final classifier layer.
+    in_features = model.classifier[-1].in_features
+    model.classifier[-1] = nn.Linear(in_features, num_classes)
+    return model
 
 
 # training -----------------------------------------------------------------------------
 
 
 def main():
-    # Step 1) define transformations on the images. Here we resize the images and
-    # convert them to tensors.
-    transform = transforms.Compose(
+    start_time = time.time()
+    torch.manual_seed(SEED)
+    torch.set_num_threads(max(1, (torch.get_num_threads() // 2)))
+
+    weights = MobileNet_V3_Small_Weights.DEFAULT
+    # Some torchvision builds don't expose mean/std in weights.meta.
+    # MobileNetV3 ImageNet weights use standard ImageNet normalization.
+    mean = (0.485, 0.456, 0.406)
+    std = (0.229, 0.224, 0.225)
+
+    train_transform = transforms.Compose(
         [
-            transforms.Resize((IMAGE_WIDTH, IMAGE_HEIGHT)),
+            transforms.RandomResizedCrop(IMAGE_SIZE, scale=(0.7, 1.0)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
             transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std),
+        ]
+    )
+    eval_transform = transforms.Compose(
+        [
+            transforms.Resize(256),
+            transforms.CenterCrop(IMAGE_SIZE),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std),
         ]
     )
 
+    print("Loading dataset...", flush=True)
     # Step 2) split the data into a train set and a validation set, and create data
     # loaders for each. See DSC 80 for why doing this is important!
-    full_dataset = SoCalDataset(TRAIN_DIR, transform=transform)
+    full_dataset = SoCalDataset(TRAIN_DIR, transform=None)
     val_size = int(len(full_dataset) * VALIDATION_FRACTION)
     train_size = len(full_dataset) - val_size
     train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
 
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    train_dataset.dataset.transform = train_transform
+    val_dataset.dataset.transform = eval_transform
+
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
     # Step 3) define the model, loss function, and optimizer. The model is a simple
     # logistic regression model defined above. The loss function is cross-entropy loss,
     # which is commonly used for multi-class classification problems. The optimizer is
     # Adam.
-
-    input_dim = 3 * IMAGE_WIDTH * IMAGE_HEIGHT  # channels x height x width
-    model = LogisticRegression(input_dim, len(CLASSES))
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = build_model(len(CLASSES)).to(device)
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    # We'll create the optimizer after (un)freezing so the parameter groups match.
+    optimizer = None
+    scheduler = None
 
     # Step 4) the training loop.
 
+    def save_checkpoint():
+        payload = {
+            "state_dict": model.state_dict(),
+            "classes": CLASSES,
+            "image_size": IMAGE_SIZE,
+            "normalize": {"mean": mean, "std": std},
+            "arch": "mobilenet_v3_small",
+        }
+        torch.save(payload, "model.pt")
+
+    print(f"Training on device={device} ...", flush=True)
     for epoch in range(EPOCHS):
+        # Freeze backbone for first few epochs (train classifier head only).
+        if epoch == 0:
+            for p in model.features.parameters():
+                p.requires_grad = False
+            for p in model.classifier.parameters():
+                p.requires_grad = True
+            optimizer = torch.optim.AdamW(
+                model.classifier.parameters(), lr=LEARNING_RATE_HEAD, weight_decay=1e-4
+            )
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, FREEZE_EPOCHS))
+
+        if epoch == FREEZE_EPOCHS:
+            for p in model.features.parameters():
+                p.requires_grad = True
+            optimizer = torch.optim.AdamW(
+                [
+                    {"params": model.features.parameters(), "lr": LEARNING_RATE_BACKBONE},
+                    {"params": model.classifier.parameters(), "lr": LEARNING_RATE_HEAD},
+                ],
+                weight_decay=1e-4,
+            )
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=max(1, EPOCHS - FREEZE_EPOCHS)
+            )
+
         total_loss = 0.0
         correct = 0
         total = 0
 
-        for images, labels in train_loader:
+        for step, (images, labels) in enumerate(train_loader, start=1):
+            images = images.to(device)
+            labels = labels.to(device)
             outputs = model(images)
             loss = criterion(outputs, labels)
 
@@ -163,6 +210,13 @@ def main():
             correct += (outputs.argmax(dim=1) == labels).sum().item()
             total += images.size(0)
 
+            if step % 50 == 0:
+                print(
+                    f"Epoch {epoch + 1}/{EPOCHS} step {step}/{len(train_loader)} "
+                    f"loss={loss.item():.4f}",
+                    flush=True,
+                )
+
         avg_loss = total_loss / total
         accuracy = correct / total
 
@@ -172,11 +226,15 @@ def main():
         val_total = 0
         with torch.no_grad():
             for images, labels in val_loader:
+                images = images.to(device)
+                labels = labels.to(device)
                 outputs = model(images)
                 val_correct += (outputs.argmax(dim=1) == labels).sum().item()
                 val_total += images.size(0)
         val_accuracy = val_correct / val_total
         model.train()
+        if scheduler is not None:
+            scheduler.step()
 
         print(
             f"Epoch {epoch + 1}/{EPOCHS}  "
@@ -185,8 +243,11 @@ def main():
             f"val_accuracy: {val_accuracy:.4f}"
         )
 
-    torch.save(model.state_dict(), "model.pt")
-    print("Saved model to model.pt")
+        save_checkpoint()
+        print("Saved model.pt", flush=True)
+
+    elapsed_s = time.time() - start_time
+    print(f"Total training time: {elapsed_s/60:.2f} minutes", flush=True)
 
 if __name__ == "__main__":
     main()
