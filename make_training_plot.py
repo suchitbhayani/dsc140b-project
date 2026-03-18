@@ -36,5 +36,5 @@ ax2.tick_params(axis="y", labelcolor=color_acc)
 
 fig.suptitle("Training Loss and Validation Accuracy vs. Epoch")
 fig.tight_layout()
-fig.savefig("training_curves.png", dpi=300)
-print("Saved training_curves.png")
+fig.savefig("images/training_curves.png", dpi=300)
+print("Saved images/training_curves.png")
