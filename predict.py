@@ -14,10 +14,17 @@ from torchvision.models import mobilenet_v3_small
 from PIL import Image
 
 
+HIDDEN_SIZE = 256
+
+
 def build_model(num_classes: int) -> nn.Module:
     model = mobilenet_v3_small(weights=None)
     in_features = model.classifier[-1].in_features
-    model.classifier[-1] = nn.Linear(in_features, num_classes)
+    model.classifier[-1] = nn.Sequential(
+        nn.Linear(in_features, HIDDEN_SIZE),
+        nn.ReLU(inplace=True),
+        nn.Linear(HIDDEN_SIZE, num_classes),
+    )
     return model
 
 
@@ -56,7 +63,14 @@ def predict(test_dir):
 
     payload = torch.load("model.pt", map_location="cpu")
     classes = payload["classes"]
-    image_size = int(payload["image_size"])
+    # Backwards-compatibility: some older checkpoints saved image_size as
+    # {"width": W, "height": H}. Newer ones save a single integer.
+    image_size_field = payload.get("image_size", 224)
+    if isinstance(image_size_field, dict):
+        # Use height (or width – they are equal for our training setup).
+        image_size = int(image_size_field.get("height", image_size_field.get("width", 224)))
+    else:
+        image_size = int(image_size_field)
     mean = tuple(payload["normalize"]["mean"])
     std = tuple(payload["normalize"]["std"])
 

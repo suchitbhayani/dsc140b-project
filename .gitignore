@@ -1,3 +1,7 @@
 data/
 .vscode/
+images/
 model.pt
+report.tex
+training_log.csv
+*.zip

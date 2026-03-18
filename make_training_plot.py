@@ -1,10 +1,24 @@
+import csv
+from pathlib import Path
+
 import matplotlib.pyplot as plt
 
-# Epoch indices (1-based)
-epochs = [1, 2, 3, 4, 5, 6]
+log_path = Path("training_log.csv")
+if not log_path.exists():
+    raise FileNotFoundError(
+        "training_log.csv not found. Run `python -u train.py` first to generate it."
+    )
 
-train_loss = [1.1435, 0.8309, 0.7601, 0.7217, 0.7012, 0.6861]
-val_acc =   [0.6509, 0.7179, 0.7266, 0.7337, 0.7309, 0.7315]
+epochs = []
+train_loss = []
+val_acc = []
+
+with log_path.open("r", newline="") as f:
+    reader = csv.DictReader(f)
+    for row in reader:
+        epochs.append(int(row["epoch"]))
+        train_loss.append(float(row["train_loss"]))
+        val_acc.append(float(row["val_accuracy"]))
 
 fig, ax1 = plt.subplots(figsize=(6, 4))
 

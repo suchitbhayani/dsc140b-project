@@ -6,7 +6,9 @@ Trains a small *pretrained* vision model (MobileNetV3-Small) on the training ima
 
 import pathlib
 
+import csv
 import torch
+import torchvision
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision import transforms
@@ -84,12 +86,19 @@ class SoCalDataset(Dataset):
 
 # model --------------------------------------------------------------------------------
 
+HIDDEN_SIZE = 256
+
+
 def build_model(num_classes: int) -> nn.Module:
     weights = MobileNet_V3_Small_Weights.DEFAULT
     model = mobilenet_v3_small(weights=weights)
-    # Replace final classifier layer.
     in_features = model.classifier[-1].in_features
-    model.classifier[-1] = nn.Linear(in_features, num_classes)
+    # Replace final layer with: hidden(1024->256) -> ReLU -> output(256->6)
+    model.classifier[-1] = nn.Sequential(
+        nn.Linear(in_features, HIDDEN_SIZE),
+        nn.ReLU(inplace=True),
+        nn.Linear(HIDDEN_SIZE, num_classes),
+    )
     return model
 
 
@@ -98,6 +107,7 @@ def build_model(num_classes: int) -> nn.Module:
 
 def main():
     start_time = time.time()
+    print(f"torch {torch.__version__}  torchvision {torchvision.__version__}", flush=True)
     torch.manual_seed(SEED)
     torch.set_num_threads(max(1, (torch.get_num_threads() // 2)))
 
@@ -147,7 +157,7 @@ def main():
     model = build_model(len(CLASSES)).to(device)
 
     criterion = nn.CrossEntropyLoss()
-    # Freeze everything except the final Linear layer.
+    # Freeze everything except the new classifier head (hidden + output layers).
     for p in model.parameters():
         p.requires_grad = False
     for p in model.classifier[-1].parameters():
@@ -169,6 +179,21 @@ def main():
             "arch": "mobilenet_v3_small_frozen_backbone",
         }
         torch.save(payload, "model.pt")
+
+    log_path = pathlib.Path("training_log.csv")
+    with log_path.open("w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "epoch",
+                "train_loss",
+                "train_accuracy",
+                "val_accuracy",
+                "elapsed_seconds",
+                "learning_rate",
+            ],
+        )
+        writer.writeheader()
 
     print(f"Training on device={device} ...", flush=True)
     for epoch in range(EPOCHS):
@@ -215,12 +240,38 @@ def main():
         model.train()
         scheduler.step()
 
+        elapsed_s = time.time() - start_time
+        lr = optimizer.param_groups[0]["lr"]
+
         print(
             f"Epoch {epoch + 1}/{EPOCHS}  "
             f"loss: {avg_loss:.4f}  "
             f"accuracy: {accuracy:.4f}  "
             f"val_accuracy: {val_accuracy:.4f}"
         )
+
+        with log_path.open("a", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "epoch",
+                    "train_loss",
+                    "train_accuracy",
+                    "val_accuracy",
+                    "elapsed_seconds",
+                    "learning_rate",
+                ],
+            )
+            writer.writerow(
+                {
+                    "epoch": epoch + 1,
+                    "train_loss": avg_loss,
+                    "train_accuracy": accuracy,
+                    "val_accuracy": val_accuracy,
+                    "elapsed_seconds": elapsed_s,
+                    "learning_rate": lr,
+                }
+            )
 
         save_checkpoint()
         print("Saved model.pt", flush=True)
